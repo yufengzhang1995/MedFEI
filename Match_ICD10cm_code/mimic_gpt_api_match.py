@@ -37,6 +37,6 @@ def extract_icd_code(text):
         return np.nan
     
 discharge_infect['gpt_icd_10'] = discharge_infect['primary_diagnosis'].apply(gen_gpt_icd)
-discharge_infect['gpt_icd_10'] = discharge_infect_sub['gpt_icd_10'].apply(extract_icd_code)
+discharge_infect['gpt_icd_10'] = discharge_infect['gpt_icd_10'].apply(extract_icd_code)
 discharge_infect.to_csv('./Med_FEI/data_temp/discharge_infect.csv')
 print('save discharge_infect with corrected ICD code and phecode to ./Med_FEI/data_temp/discharge_infect.csv')
