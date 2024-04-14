@@ -1,3 +1,9 @@
+"""
+Author: Yufeng Zhang
+Date: April 13th 2024
+
+"""
+
 import torch
 from torch import nn
 import torch.nn.functional as F
