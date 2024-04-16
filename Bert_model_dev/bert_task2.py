@@ -1,9 +1,8 @@
 """
-Author: Yufeng Zhang
-Date: April 13th 2024
+Author: Yufeng
+2024/04/13
 
 """
-
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -15,36 +14,35 @@ import numpy as np
 import os
 import pickle
 import argparse
+import csv
 
 dtype = torch.float32
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(device)
 
+
 class BertErrorSentenceDetector(nn.Module):
     def __init__(self, 
-                 num_classes = 2,
                  max_sentence_id = 40,
                  pretrained_model_name = "emilyalsentzer/Bio_ClinicalBERT",):
         super(BertErrorSentenceDetector, self).__init__()
         self.bert = AutoModel.from_pretrained(pretrained_model_name)
-        self.classifier = nn.Linear(self.bert.config.hidden_size, num_classes + max_sentence_id)
+        self.classifier = nn.Linear(self.bert.config.hidden_size, max_sentence_id)
     def forward(self, input_ids, attention_mask):
         outputs = self.bert(input_ids = input_ids, 
                             attention_mask = attention_mask)
         pooled_output = outputs.pooler_output
         logits = self.classifier(pooled_output)
-        
-        binary_output = nn.Sigmoid()(logits[:,0])
-        sentence_output = F.softmax(logits[:,1:],dim = 1)
-        return binary_output, sentence_output
+        probs = F.softmax(logits,dim = 1)
+        return probs
     
 class EHRDataset(Dataset):
     def __init__(self, dataframe, tokenizer, num_classes = 41, max_length=512):
 
         self.tokenizer = tokenizer
-        self.data = dataframe
-        self.text = dataframe['Sentences']
-        self.binary_labels = dataframe['Error Flag']
+        self.data = dataframe[dataframe['Error Flag'] != 0].reset_index()
+        self.text = self.data['Sentences']
+        self.binary_labels = self.data['Error Flag']
         self.sentence_labels = self.data['Error Sentence ID']
 
         self.max_length = max_length
@@ -102,6 +100,7 @@ class EHRCombinedDataset(Dataset):
         self.tokenizer = tokenizer
         # concatenate dataframe and then sample
         self.data = pd.concat([dataframe1,dataframe2],axis = 0)
+        self.data = self.data[self.data['Error Flag'] != 0].reset_index()
         self.data = self.data.sample(frac=1).reset_index(drop=True)
         
         self.text = self.data['Sentences']
@@ -151,29 +150,28 @@ class EHRCombinedDataset(Dataset):
         }       
 
 def compute_accuracy(pred, gt):
-    return sum(pred == gt)/len(pred)
+    return sum(pred == gt)/len(pred) 
 
-def train(model, train_loader, val_loader, criterion_binary,criterion_multiple, optimizer, num_epochs,save_dir):
+def train(model, train_loader, val_loader, criterion, optimizer, num_epochs,save_dir, checkpoint_path):
+    
+    if checkpoint_path and os.path.isfile(checkpoint_path):
+        model.load_state_dict(torch.load(checkpoint_path))
+        print(f"Loaded model weights from {checkpoint_path}")
+    else:
+        print("No checkpoint found, starting training from scratch.")
+    
+    metrics = []
     for epoch in range(num_epochs):
         model.train()
-        
         train_loss = 0
-        
         for batch in tqdm(train_loader, leave=False, desc="Training Batches"):
-            
             optimizer.zero_grad()
-            
-            
-            binary_labels = batch['binary_labels'].type(torch.float)
-            sentence_labels = batch['sentence_labels'].type(torch.float)
-            
+            labels = batch['sentence_labels'].type(torch.float)
+            preds = model(batch['input_ids'], batch['attention_mask'])
+            loss = criterion(preds, labels)
 
-            pred_binary, pred_sentence = model(batch['input_ids'], batch['attention_mask'])
-
-            binary_loss = criterion_binary(pred_binary, binary_labels)
-            sentence_loss = criterion_multiple(pred_sentence, sentence_labels)
-
-            loss = binary_loss + sentence_loss
+            if torch.isnan(loss):
+                continue
 
             # Prevent NaN values in gradients
             for param in model.parameters():
@@ -182,69 +180,65 @@ def train(model, train_loader, val_loader, criterion_binary,criterion_multiple, 
 
             loss.backward()
             optimizer.step()
-            train_loss = train_loss + binary_loss.item() + sentence_loss.item()
+            train_loss += loss.item()
 
         train_loss /= len(train_loader)
         print(f'Epoch {epoch+1}/{num_epochs}, Training Loss: {train_loss}')
-        task1_acc, task2_acc, val_loss = evaluate(model, val_loader, criterion_binary, criterion_multiple, save_dir)
         
-        val_loss /= len(val_loader)
-        print(f'Epoch {epoch+1}/{num_epochs}, Task 1 Accuracy: {task1_acc}, Task 2 Accuracy: {task2_acc}, Validation Loss: {val_loss}')
+        acc, val_loss = evaluate(model, val_loader, criterion, save_dir)
+        print(f'Epoch {epoch+1}/{num_epochs}, Task 2 Accuracy: {acc}, Validation Loss: {val_loss}')
 
-def evaluate(model, val_loader, criterion_binary, criterion_multiple,save_dir):
+        metrics.append({
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "task2_acc": acc,
+            "val_loss": val_loss
+        })
+        
+        if epoch%10 == 0:
+            torch.save(model.state_dict(), os.path.join(save_dir, 'model.pth'))
     
-    gold_binary = []
+    metrics_path = os.path.join(save_dir, 'training_metrics.csv')
+    with open(metrics_path, 'w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=["epoch", "train_loss", "task2_acc", "val_loss"])
+        writer.writeheader()
+        for data in metrics:
+            writer.writerow(data)
+    print(f"Training metrics saved to {metrics_path}")
+
+def evaluate(model, val_loader, criterion, save_dir):
     gold_sentence = []
-    
-    task1_preds = []
     task2_preds = []
     
     model.eval()
-    task1_acc = 0
-    task2_acc = 0
+    acc = 0
     val_loss = 0
+    
     with torch.no_grad():
         for batch in tqdm(val_loader, leave=False, desc="Validation Batches"):
-            # input_ids = batch['input_ids'].to(device)
-            # attention_mask = batch['attention_mask']
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask']
+            labels = batch['sentence_labels'].type(torch.float)
 
-            binary_labels = batch['binary_labels'].type(torch.float)
-            sentence_labels = batch['sentence_labels'].type(torch.float)
+            preds = model(input_ids, attention_mask)
+            loss = criterion(preds, labels)
+            val_loss += loss.item()
 
-            pred_binary, pred_sentence = model(batch['input_ids'], batch['attention_mask'])
-            
-            binary_loss = criterion_binary(pred_binary, binary_labels)
-            sentence_loss = criterion_multiple(pred_sentence, sentence_labels)
-            
-            val_loss = val_loss + binary_loss.item() + sentence_loss.item()
-
-            
-
-            task1_pred = (pred_binary > 0.5).cpu()
-            task1_acc += compute_accuracy(task1_pred, binary_labels.cpu())
-            gold_binary.append(binary_labels.cpu())
-            task1_preds.append(task1_pred)
-
-            task2_pred = torch.argmax(pred_sentence, dim=1).cpu()
-            sentence_labels = torch.argmax(sentence_labels, dim=1).cpu()
-            task2_acc += compute_accuracy(task2_pred, sentence_labels)
+            task2_pred = torch.argmax(preds, dim=1).cpu()
+            sentence_labels = torch.argmax(labels, dim=1).cpu()
+            acc += compute_accuracy(task2_pred, sentence_labels)
             gold_sentence.append(sentence_labels)
             task2_preds.append(task2_pred)
-
-
+            
     output = {
-        "gold_binary": [tensor.numpy() for tensor in gold_binary],
         "gold_sentence": [tensor.numpy() for tensor in gold_sentence],
-        "task1_preds": [tensor.numpy() for tensor in task1_preds],
         "task2_preds": [tensor.numpy() for tensor in task2_preds]
     }
 
     with open(os.path.join(save_dir,'output.pkl'), 'wb') as file:
         pickle.dump(output, file)
-    
-    return task1_acc / len(val_loader), task2_acc / len(val_loader), val_loss / len(val_loader)
 
-
+    return acc / len(val_loader), val_loss / len(val_loader)
 
 def handle_MIMIC_data(raw_df_2, sample_num = 2000):
     
@@ -274,31 +268,30 @@ def handle_MIMIC_data(raw_df_2, sample_num = 2000):
     num_classes = max(max_index,40) 
     return train_df_2,int(num_classes)
 
-
-
-
-
-
-
 def main():
     # parse command line arguments
     parser = argparse.ArgumentParser(description = 'Bert model training')
-    parser.add_argument('--epoch', type = int, default = 10, help = 'epoch')
+    parser.add_argument('--pre_m', type = str, default = 'emilyalsentzer/Bio_ClinicalBERT', help = 'pre-trained model name')
+    parser.add_argument('--epoch', type = int, default = 5, help = 'epoch')
     parser.add_argument('--lr',type = float, default = '1e-5', help = 'learning rate')
     parser.add_argument('--num', type = int, default = 2000, help = 'MIMIC_sample_num')
     parser.add_argument('--dataset', type = str, default = 'UW', help = 'dataset name')
     parser.add_argument('--option', type = int, default = 3000, help = 'number of enhanced files')
     parser.add_argument('--bs',  type = int, default = 8, help = 'batch size')
+    parser.add_argument('--regu',  type = float, default = 1e-5, help = 'batch size')
+    parser.add_argument('--checkpoint_path', default = None, help = 'checkpoint_path')
     args = parser.parse_args()
 
 
-
+    model_name = args.pre_m
     dataset = args.dataset
     learning_rate = args.lr
     MIMIC_sample_num = args.num
     epoch = args.epoch
     option = args.option
     batch_size = args.bs
+    regu = args.regu
+    checkpoint_path = args.checkpoint_path
 
     print("Dataset:", args.dataset)
     print("Learning Rate:", args.lr)
@@ -306,25 +299,17 @@ def main():
     print("Epoch:", args.epoch)
     print("Option:", args.option)
     print("Batch Size:", args.bs)
+    print("Regularization:", args.regu)
 
 
 
-
-# dataset = 'MIMIC'
-# option = '3000'
-
-
-
-# epoch_ls = [10,20,30]
-# learning_rate_ls = [1e-5,1e-4,1e-3]
-# MIMIC_sample_num = 2000
-    tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if dataset == 'UW':
         train_data_dir = './Data/UW/Feb_1_2024_MS_Train_Val_Datasets'
         train_df = pd.read_csv(os.path.join(train_data_dir, 'MEDIQA-CORR-2024-MS-TrainingData.csv'))
         train_dataset = EHRDataset(train_df,tokenizer)
-
+        max_index = 41
     elif dataset == 'MIMIC':
         train_data_dir = './Data/MIMIC'
         raw_df = pd.read_csv(os.path.join(train_data_dir, 'merged_corrupted_mimic.csv'))
@@ -373,7 +358,11 @@ def main():
     
     print('Length of the dataset:',len(train_dataset))
     
-    save_dir = f'./models/dataset_{dataset}_epoch_{epoch}_learning_rate_{learning_rate}'
+    save_root = f'./models/task2/{model_name}'
+    if not os.path.isdir(save_root):
+        os.mkdir(save_root)
+        
+    save_dir = os.path.join(save_root,f'dataset_{dataset}_epoch_{epoch}_learning_rate_{learning_rate}_regu_{regu}')
     if not os.path.isdir(save_dir):
         os.mkdir(save_dir)
     
@@ -387,13 +376,30 @@ def main():
                              num_classes = max_index)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
 
-    loss_fn_binary = nn.BCELoss()
-    loss_fn_multiple = nn.CrossEntropyLoss()
-    model = BertErrorSentenceDetector(max_sentence_id = max_index-1)
+    loss_fn = nn.CrossEntropyLoss()
+    model = BertErrorSentenceDetector(max_index,model_name)
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr = learning_rate)
-    train(model, train_dataloader, val_dataloader, loss_fn_binary, loss_fn_multiple, optimizer, epoch,save_dir)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=regu)
+    
+    train(model, train_dataloader, val_dataloader, loss_fn, optimizer, epoch, save_dir, checkpoint_path = checkpoint_path)
     torch.save(model.state_dict(), os.path.join(save_dir,'model.pth'))
         
 if __name__ == '__main__':
     main()
+  
+# data_dir = './Data/UW/Feb_1_2024_MS_Train_Val_Datasets'
+# train_df = pd.read_csv(os.path.join(data_dir, 'MEDIQA-CORR-2024-MS-TrainingData.csv'),index_col = 0)
+# val_df = pd.read_csv(os.path.join(data_dir, 'MEDIQA-CORR-2024-MS-ValidationSet-1-Full.csv'),index_col = 0)
+# tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+
+# train_dataset = EHRDataset(train_df,tokenizer)
+# train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+# val_dataset = EHRDataset(val_df,tokenizer)
+# val_dataloader = DataLoader(val_dataset, batch_size=8, shuffle=True)
+
+# loss_fn = nn.CrossEntropyLoss()
+# model = BertErrorSentenceDetector()
+# model.to(device)
+# optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-5)
+# train(model, train_dataloader, val_dataloader, loss_fn, optimizer, 5)
+# torch.save(model.state_dict(), './models/test_task2.pth')
