@@ -4,7 +4,7 @@ import pandas as pd
 import re
 import numpy as np
 
-api_key = "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"
+api_key = ""
 
 client = OpenAI(
     # This is the default and can be omitted
